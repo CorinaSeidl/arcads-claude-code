@@ -22,6 +22,7 @@ from adapters.base import (
     GenerationRequest,
     GenerationResult,
 )
+from adapters.policy import ProductFidelityGuard
 
 
 class UnimplementedBackend(CreativeBackend):
@@ -52,6 +53,10 @@ class UnimplementedBackend(CreativeBackend):
         return None  # no vendor integration to quote against
 
     def generate(self, request: GenerationRequest) -> list[GenerationResult]:
+        # Defense-in-depth, same as ArcadsBackend — checked before the "not implemented"
+        # path so future real implementations inherit the guard automatically.
+        if request.product_lock is not None:
+            ProductFidelityGuard.check(self, request)
         raise NotImplementedError(
             f"{self.name} backend is not implemented in this repo yet. "
             f"{self.setup_note} See docs/adapter/DESIGN.md § 4.5 / § 6 and "

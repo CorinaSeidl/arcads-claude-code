@@ -111,7 +111,9 @@ class ProductFidelityGuard:
             )
 
 
-def _sha256_of(path: Path) -> str | None:
+def sha256_of(path: Path) -> str | None:
+    """sha256 of a file's bytes, or None if it doesn't exist. Shared by provenance
+    builders across backends (e.g. adapters/local_compositor_backend.py)."""
     if not path.exists():
         return None
     h = hashlib.sha256()
@@ -133,7 +135,7 @@ def build_provenance(
         "kind": request.kind,
         "variant": result.variant,
         "output_path": str(result.path),
-        "output_sha256": _sha256_of(result.path),
+        "output_sha256": sha256_of(result.path),
         "prompt_sha256": prompt_hash,
         "prompt_word_count": len(request.prompt.split()),
         "reference_count": len(request.references),

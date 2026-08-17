@@ -54,6 +54,8 @@ class GenerationRequest:
     output_dir: Path = Path("./generated")
     start_frame: Path | None = None  # approved still used to start a video (still-before-video)
     model: str | None = None  # backend-specific model hint; interpretation is per-backend
+    background: Path | None = None  # local background image, e.g. for compositor backends
+    options: dict = field(default_factory=dict)  # backend-specific extras (e.g. compositor mode)
 
     def __post_init__(self) -> None:
         if self.kind == "image_edit" and self.source is None:

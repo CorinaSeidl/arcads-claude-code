@@ -47,3 +47,14 @@ This directory contains **append-only logs** of every Arcads API generation call
 - **When pricing rules emerge:** derive per-second or per-unit rates from recorded data and document them in `MASTER_CONTEXT.md`.
 
 Logs are **not gitignored** — historical cost data across sessions is valuable. Do NOT log API keys, Authorization headers, or full prompt text (prompts can be large; store a word count instead).
+
+## `adapter-calls.jsonl`
+
+Backend-agnostic sibling of `arcads-api.jsonl`, written by `adapters/cli.py` (see
+`docs/adapter/DESIGN.md`) for every call made through the vendor-neutral adapter layer
+— Arcads or otherwise. Same discipline (no secrets, no raw prompt text — only a
+sha256 hash and word count), superset schema: `cost.unit` may be `"credits"` or
+`"usd"` (or the whole `cost` object may be `null` if the backend can't quote), and
+`backend` names which adapter handled the call (`"arcads"`, `"local_compositor"`,
+etc.) rather than assuming Arcads. See `adapters/policy.py`'s `build_provenance()` for
+the exact fields.

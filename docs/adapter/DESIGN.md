@@ -1,6 +1,7 @@
 # Vendor-neutral Operations OS adaptation — design doc
 
-Status: Phase 0 (substrate only, no backend rewiring). Branch: `feature/vendor-neutral-adapter-layer`.
+Status: Phase 2 complete (one skill wired end-to-end + one real credential-free
+backend). Branch: `feature/vendor-neutral-adapter-layer`. See § 7 for Phase 2.
 
 This repo (`arcads-claude-code`) currently ships a terminal-first, Claude-Code-driven
 creative-production workflow that is hardwired to one vendor: Arcads
@@ -266,9 +267,90 @@ actually having that vendor's credentials to validate against.
       would be needed and what remains unimplemented.
 
 **Future phases (not in this change):**
-- [ ] At least one skill's SKILL.md updated to call `adapters.registry` instead of a
+- [x] At least one skill's SKILL.md updated to call `adapters.registry` instead of a
       hardcoded script path, with the Arcads path behaviorally unchanged end-to-end.
-- [ ] One additional backend (user's choice — likely OpenAI, since product-fidelity
-      editing via `images/edits` is closest to already-documented `image_edit` mode)
-      implemented and validated by the user against their own credentials/spend.
-- [ ] `logs/adapter-calls.jsonl` schema adopted by at least one live skill run.
+      — done in Phase 2 (`chatgpt-image-ad`).
+- [ ] One additional real vendor backend (OpenAI is the natural next one — its
+      `images/edits` endpoint maps directly onto the `IMAGE_EDIT` capability and the
+      product-fidelity guard) implemented and validated by the user against their own
+      credentials/spend. Not done — no credentials, no billable calls made.
+- [x] `logs/adapter-calls.jsonl` schema adopted by at least one live skill run — done;
+      see § 7.4 for a real local execution.
+
+## 7. Phase 2 — one skill wired end-to-end, one real credential-free backend
+
+Phase 2 answers the question Phase 1 left open: does the adapter contract actually
+hold up when a real skill routes through it, and can useful work happen without any
+vendor credentials at all? Two things were added to prove it, both real:
+
+### 7.1 `chatgpt-image-ad` now routes through the adapter
+
+`skills/chatgpt-image-ad/SKILL.md` Phase 5 was rewritten to invoke
+`python3 -m adapters generate --backend arcads --model gpt-image-2 ...` instead of
+calling `scripts/generate_image.py` directly. The script itself is **byte-for-byte
+unchanged** — `adapters.ArcadsBackend` shells out to it exactly as it did in Phase 1.
+The skill is not duplicated per vendor: the same command with `--backend
+local_compositor` (or `compose`, its dedicated shorthand) reaches the second backend
+below. This was the smallest change that satisfies "stop calling Arcads-specific
+execution directly" without touching a single line of Arcads request-building logic.
+
+### 7.2 `local_compositor` — a real, credential-free, deterministic backend
+
+`adapters/local_compositor_backend.py` never calls a vendor. Given a canonical local
+product image and a locally-supplied background (from anywhere — this skill's own
+Arcads path with no product in the prompt, another tool entirely, or a photograph),
+it deterministically composites them onto a standard social canvas (Pillow: resize
+the background to cover, resize/paste the product, write PNG). This required adding
+Pillow as this package's one non-stdlib dependency (`adapters/requirements.txt`) —
+stdlib alone cannot decode/composite arbitrary JPEG inputs. Every other module in
+`adapters/` remains stdlib-only.
+
+Two placement modes: `native` (paste at original resolution — refuses to run at all
+if the product doesn't fit, rather than silently downscaling it) is pixel-exact by
+construction; `fit` (Lanczos-resize down to fit, never upscale) is documented and
+reproducible but not pixel-exact, and says so in its own provenance record
+(`product_pixels_exact: false`) — never conflated with an AI redraw.
+
+### 7.3 Product-fidelity guard is now enforced at every real entry point, not just as a library call
+
+Phase 1 shipped `ProductFidelityGuard.check()` as a function callers *could* invoke.
+Phase 2 makes it structurally unavoidable: `ArcadsBackend.generate()`,
+`UnimplementedBackend.generate()` (inherited by every stub), and
+`LocalCompositorBackend.generate()` all call the guard themselves as the first thing
+they do when `request.product_lock` is set — before checking credentials, before
+building any request. The CLI (`adapters/cli.py`) also checks it explicitly at the
+`generate`/`compose` entry points, for a clean exit code instead of a raised
+exception reaching the terminal. This means a product-locked request cannot reach a
+full-generation (`kind="image"`) path in *any* backend, current or future, even if a
+caller forgets to check — proven by
+`adapters/tests/test_product_fidelity_enforcement.py`, which calls `generate()`
+directly (mocking only the subprocess boundary) and asserts `ProductFidelityViolation`
+fires before anything else happens.
+
+### 7.4 Real local run (no network, no vendor)
+
+```bash
+python3 -m adapters compose \
+  --product references/products/048e6abb-00d5-4dae-820a-ad4769bc45d2.jpg \
+  --background outputs/demo/background.png \
+  --output outputs/demo/product-vertical.png \
+  --aspect 9:16 --mode fit
+```
+
+Ran twice against identical inputs; outputs were byte-identical (`cmp` exit 0),
+confirming determinism live, not just in a unit test. This also surfaced a real bug —
+`compose` renamed the output file to `--output` *after* the generic
+`build_provenance()` helper had already hashed it at its pre-rename path, so
+`logs/adapter-calls.jsonl` recorded `output_sha256: null`. Fixed by recomputing the
+hash against the final path before logging; regression-tested in
+`adapters/tests/test_cli.py::test_real_local_run_produces_file_and_provenance`.
+
+### 7.5 What Phase 2 deliberately does not do
+
+- No OpenAI/Runway/Canva/Descript request-building — still honest stubs, per the task
+  constraint. `local_compositor` is the only new *executable* backend.
+- Arcads video models are still not wired into the adapter (unchanged from Phase 1
+  scope) — `chatgpt-image-ad` only needed image/image_edit.
+- No other skill (`nano-banana-image-ad`, `generate-youtube-thumbnail`,
+  `image-ad-clone`, `arcads-external-api` itself) was touched — they call their
+  scripts directly exactly as before Phase 2.

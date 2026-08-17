@@ -27,6 +27,7 @@ from adapters.base import (
     GenerationRequest,
     GenerationResult,
 )
+from adapters.policy import ProductFidelityGuard
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CHATGPT_SCRIPT = _REPO_ROOT / "skills" / "chatgpt-image-ad" / "scripts" / "generate_image.py"
@@ -106,6 +107,12 @@ class ArcadsBackend(CreativeBackend):
         )
 
     def generate(self, request: GenerationRequest) -> list[GenerationResult]:
+        # Defense-in-depth: enforced here (not just by an optional caller-side check)
+        # so a product-locked request can never reach Arcads' full text-to-image path,
+        # even if the CLI/orchestrator forgets to check first. See docs/adapter/PRODUCT_FIDELITY.md.
+        if request.product_lock is not None:
+            ProductFidelityGuard.check(self, request)
+
         if request.kind not in ("image", "image_edit"):
             raise ValueError(
                 f"arcads backend (phase 1) only supports kind='image'/'image_edit', "

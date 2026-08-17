@@ -9,18 +9,25 @@ from adapters.arcads_backend import ArcadsBackend
 from adapters.base import CreativeBackend
 from adapters.canva_backend import CanvaBackend
 from adapters.descript_backend import DescriptBackend
+from adapters.local_compositor_backend import LocalCompositorBackend
 from adapters.openai_backend import OpenAIBackend
 from adapters.remotion_backend import RemotionBackend
 from adapters.runway_backend import RunwayBackend
 
 BACKENDS: dict[str, type[CreativeBackend]] = {
     "arcads": ArcadsBackend,
+    "local_compositor": LocalCompositorBackend,
     "openai": OpenAIBackend,
     "runway": RunwayBackend,
     "remotion": RemotionBackend,
     "canva": CanvaBackend,
     "descript": DescriptBackend,
 }
+
+# Backends with a real, executable request path today (no vendor credentials
+# required to at least attempt a call — arcads still needs its own .env, but the
+# *code path* is real, unlike the stub backends below).
+_EXECUTABLE_BACKENDS = frozenset({"arcads", "local_compositor"})
 
 
 def get_backend(name: str) -> CreativeBackend:
@@ -45,7 +52,7 @@ def list_backends() -> list[dict]:
                 "capabilities": sorted(c.value for c in backend.capabilities()),
                 "credentials_ok": cred.ok,
                 "detail": cred.detail,
-                "executable": name == "arcads",  # only honest "real" backend today
+                "executable": name in _EXECUTABLE_BACKENDS,
             }
         )
     return out

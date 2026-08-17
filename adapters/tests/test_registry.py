@@ -7,10 +7,10 @@ from adapters.registry import BACKENDS, get_backend, list_backends
 
 
 class TestRegistry(unittest.TestCase):
-    def test_all_six_backends_registered(self) -> None:
+    def test_all_seven_backends_registered(self) -> None:
         self.assertEqual(
             set(BACKENDS),
-            {"arcads", "openai", "runway", "remotion", "canva", "descript"},
+            {"arcads", "local_compositor", "openai", "runway", "remotion", "canva", "descript"},
         )
 
     def test_get_unknown_backend_raises(self) -> None:
@@ -21,9 +21,10 @@ class TestRegistry(unittest.TestCase):
         backend = get_backend("openai")
         self.assertEqual(backend.name, "openai")
 
-    def test_only_arcads_marked_executable(self) -> None:
+    def test_arcads_and_local_compositor_marked_executable(self) -> None:
         entries = {e["name"]: e for e in list_backends()}
         self.assertTrue(entries["arcads"]["executable"])
+        self.assertTrue(entries["local_compositor"]["executable"])
         for name in ("openai", "runway", "remotion", "canva", "descript"):
             self.assertFalse(entries[name]["executable"], f"{name} should not be executable")
 
@@ -32,7 +33,7 @@ class TestRegistry(unittest.TestCase):
         # check_credentials() tried a network call, this would hang or error in a
         # sandboxed test environment.
         entries = list_backends()
-        self.assertEqual(len(entries), 6)
+        self.assertEqual(len(entries), 7)
 
     def test_stub_backend_generate_raises_not_implemented(self) -> None:
         backend = get_backend("runway")
