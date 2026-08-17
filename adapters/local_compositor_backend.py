@@ -54,7 +54,7 @@ class CompositorError(RuntimeError):
     pass
 
 
-def _resize_cover(img: "Image.Image", target_w: int, target_h: int) -> "Image.Image":
+def resize_cover(img: "Image.Image", target_w: int, target_h: int) -> "Image.Image":
     """Resize (Lanczos) + center-crop so img exactly fills target_w x target_h,
     matching CSS `background-size: cover` semantics. Deterministic for fixed inputs."""
     src_w, src_h = img.size
@@ -107,7 +107,7 @@ def composite(
 
     canvas_w, canvas_h = canvas_size
     background = Image.open(background_path).convert("RGB")
-    canvas = _resize_cover(background, canvas_w, canvas_h)
+    canvas = resize_cover(background, canvas_w, canvas_h)
 
     product = Image.open(product_path).convert("RGBA")
     pw, ph = product.size

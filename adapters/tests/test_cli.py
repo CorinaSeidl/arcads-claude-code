@@ -73,21 +73,29 @@ class TestListCommand(unittest.TestCase):
 
 class TestGenerateBackendSelection(unittest.TestCase):
     def test_selects_backend_by_name_and_builds_matching_request(self) -> None:
+        # Regression: this test calls --confirm-cost, which reaches write_provenance().
+        # It MUST patch _ADAPTER_LOG — without this, an earlier version of this test
+        # silently appended junk "fake"-backend entries to the real, committed
+        # logs/adapter-calls.jsonl on every test run. Caught during Phase 3.
         fake = _RecordingBackend()
-        with mock.patch("adapters.cli.get_backend", return_value=fake) as get_backend_mock:
-            code, out, _ = _run(
-                [
-                    "generate",
-                    "--backend", "totally-fake-backend",
-                    "--model", "some-model",
-                    "--kind", "image",
-                    "--prompt", "a nice ad",
-                    "--aspect-ratio", "1:1",
-                    "--n", "2",
-                    "--out", "./generated",
-                    "--confirm-cost",
-                ]
-            )
+        with tempfile.TemporaryDirectory() as d:
+            fake_log = Path(d) / "adapter-calls.jsonl"
+            with mock.patch("adapters.cli.get_backend", return_value=fake) as get_backend_mock, \
+                    mock.patch.object(cli, "_ADAPTER_LOG", fake_log):
+                code, out, _ = _run(
+                    [
+                        "generate",
+                        "--backend", "totally-fake-backend",
+                        "--model", "some-model",
+                        "--kind", "image",
+                        "--prompt", "a nice ad",
+                        "--aspect-ratio", "1:1",
+                        "--n", "2",
+                        "--out", "./generated",
+                        "--confirm-cost",
+                    ]
+                )
+            self.assertTrue(fake_log.exists())  # proves provenance was written, just not to the real log
         get_backend_mock.assert_called_once_with("totally-fake-backend")
         self.assertEqual(code, 0)
         self.assertIsNotNone(fake.last_request)

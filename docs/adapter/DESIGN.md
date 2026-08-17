@@ -1,7 +1,7 @@
 # Vendor-neutral Operations OS adaptation — design doc
 
-Status: Phase 2 complete (one skill wired end-to-end + one real credential-free
-backend). Branch: `feature/vendor-neutral-adapter-layer`. See § 7 for Phase 2.
+Status: Phase 3 complete (full local production job contract, end to end).
+Branch: `feature/vendor-neutral-adapter-layer`. See § 7 for Phase 2, § 8 for Phase 3.
 
 This repo (`arcads-claude-code`) currently ships a terminal-first, Claude-Code-driven
 creative-production workflow that is hardwired to one vendor: Arcads
@@ -354,3 +354,101 @@ hash against the final path before logging; regression-tested in
 - No other skill (`nano-banana-image-ad`, `generate-youtube-thumbnail`,
   `image-ad-clone`, `arcads-external-api` itself) was touched — they call their
   scripts directly exactly as before Phase 2.
+
+## 8. Phase 3 — one complete terminal-first production job, manifest to approval package
+
+Phase 2 proved a single generation call could route through the adapter. Phase 3
+proves the *job* — the unit of work a human actually approves — end to end: a
+manifest describes intent, the runner validates it, enforces fidelity, generates,
+QA's the result against reality (not just against itself), records provenance, and
+produces a package a human can review without re-deriving anything.
+
+### 8.1 Job manifest (`adapters/job.py`)
+
+`CreativeJob` is a thin wrapper, not a new execution contract — `to_generation_request()`
+builds the exact same `GenerationRequest` every other adapter path already uses. It adds
+what a `GenerationRequest` alone doesn't carry: a stable `job_id`, `channel`,
+`output_dir` as a job-level concept (not just an implementation detail of one call),
+and a `provenance_seed` (`requested_by`/`notes`) that gets folded into the output
+provenance record — see § 3 (Reusable vendor-neutral concepts) "provenance logging
+pattern," now with human-facing who/why context, not just machine facts.
+
+`product.fidelity` is a required field (`"environment-only"` or the explicit opt-out
+`"none"`) — the manifest format makes the fidelity decision visible and reviewable
+before a job ever runs, rather than something buried in a backend call.
+
+### 8.2 Job runner (`adapters/job_runner.py`) and its Phase 3 boundary
+
+`run_job()` is deliberately narrow: `SUPPORTED_BACKENDS_FOR_RUN_JOB = {"local_compositor"}`.
+Any manifest naming a different backend — `"arcads"` included — is refused before the
+registry is even consulted, let alone credentials checked or a subprocess spawned.
+This isn't a workaround for missing Arcads credentials; it's the explicit Phase 3
+constraint ("do not wire any network backend in this phase") enforced in code, not
+just in this document. `adapters/tests/test_job_runner.py::TestDeliberateUnsafeBackendFailure`
+proves it by mocking the subprocess boundary and asserting zero calls.
+
+A second, independent layer of protection exists beneath the allowlist:
+`ProductFidelityGuard.check()` still runs whenever a job carries a `ProductLock`,
+so if a future phase widens the allowlist to include a backend that lacks
+`IMAGE_EDIT`, a product-locked job is still refused — proven in
+`TestGuardStillProtectsBeyondTheAllowlist` by temporarily monkeypatching the
+allowlist to admit a hypothetical unsafe backend and confirming the guard, not the
+allowlist, is what stops it.
+
+Every failure — missing product, missing background, unsupported aspect ratio,
+disallowed backend, fidelity violation — still writes an `approval-manifest.json`
+documenting the reason. Nothing fails silently; a FAIL is exactly as reviewable as a PASS.
+
+### 8.3 QA (`adapters/qa.py`) — deterministic, not heuristic
+
+All 6 required checks are either plain file/metadata assertions or an independently
+recomputed deterministic transform compared byte-for-byte against the real output —
+no ML, no OCR, no network. The "no unexpected text overlay" requirement in particular
+is satisfied structurally: `local_compositor` never calls a text/draw API at all (see
+`adapters/local_compositor_backend.py` — resize/crop/paste only), and the QA check
+proves that end-to-end by recomputing the background-only composite independently
+(`resize_cover`, the same function the backend itself uses) and diffing it against the
+actual output everywhere outside the product's placement box. A pixel mismatch there
+means *something* was drawn onto the canvas beyond background+product — caught
+regardless of what that something was.
+
+### 8.4 Real production run
+
+```bash
+python3 -m adapters run-job jobs/soulcraft-maca-matcha.json
+```
+
+Ran twice, live, against the real file
+`references/products/048e6abb-00d5-4dae-820a-ad4769bc45d2.jpg` (the same product used
+in the Phase 2 `compose` demo) — both runs: `PASS`, 6/6 QA checks, identical
+`output_sha256` across both runs (and identical to the Phase 2 `compose` demo output,
+since the underlying inputs and params are the same — a nice cross-phase confirmation
+of determinism). A deliberate `--backend arcads` variant of the same job was also run
+live and confirmed `FAIL` (exit code 1) with zero subprocess/network calls, matching
+the automated regression test. Evidence preserved under `outputs/jobs/` (gitignored).
+
+### 8.5 What Phase 3 deliberately does not do
+
+- No OpenAI/Runway/Canva/Descript/Arcads request-building added to `run-job` — only
+  `local_compositor` executes.
+- No masked/region-level `ProductLock` (still whole-canonical-image preservation,
+  `mode="environment-only"` only — documented as a gap since Phase 1,
+  `docs/adapter/PRODUCT_FIDELITY.md`).
+- No batch/multi-output job support — a job manifest produces exactly one asset
+  (`n=1`); batching is a natural but unimplemented extension.
+- No publish/distribution step — `run_job()` stops at the approval package, by design.
+
+### 8.6 Gaps before a real generative backend can be plugged in
+
+- A real vendor backend (OpenAI is still the natural first pick — see § 6) needs to be
+  implemented, credentialed, and validated by the user before `SUPPORTED_BACKENDS_FOR_RUN_JOB`
+  should grow to include it. When it does, the QA suite needs a generative-specific
+  addition: `no_unexpected_overlay`'s pixel-diff approach only works because
+  `local_compositor` is provably non-generative; a generative backend's QA needs the
+  visual-inspection step already documented in `skills/arcads-external-api/SKILL.md`
+  ("Generated image QA") — a human/agent look, not a pixel diff.
+- The job manifest schema has no versioning field yet — fine for one schema, but worth
+  adding (`"schema_version": 1`) before a second, incompatible revision happens.
+- `run-job` always uses `n=1`; multi-variant job manifests (e.g. "give me 3 crops of
+  this campaign") aren't supported and would need either a `variants` array in the
+  manifest or a loop at the CLI layer.

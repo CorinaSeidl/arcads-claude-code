@@ -130,6 +130,73 @@ ProductFidelityGuard.check(backend, request)  # raises ProductFidelityViolation 
 results = backend.generate(request)
 ```
 
+## Full production jobs: `run-job`
+
+`compose` is the raw primitive; `run-job` is the full production contract — a job
+manifest goes in, an approval-ready package comes out. It resolves and validates
+inputs, enforces `ProductFidelityGuard`, generates via `local_compositor`, runs 6
+deterministic QA checks, writes provenance (both the shared `logs/adapter-calls.jsonl`
+and a self-contained per-job `provenance.json`), and writes an `approval-manifest.json`
+— then stops. There is no publish/distribution step here; that's a human decision made
+elsewhere (this repo's separate `meta-ad-builder` skill, untouched by any of this).
+
+```bash
+python3 -m adapters run-job jobs/soulcraft-maca-matcha.json
+```
+
+### Job manifest schema
+
+```json
+{
+  "job_id": "soulcraft-maca-matcha-vertical-story",
+  "channel": "instagram_story",
+  "product": { "asset": "references/products/<file>.jpg", "fidelity": "environment-only" },
+  "background": { "asset": "outputs/demo/background.png" },
+  "aspect_ratio": "9:16",
+  "backend": "local_compositor",
+  "composite": { "mode": "fit", "position": "center", "margin": 0.08 },
+  "output_dir": "outputs/jobs/soulcraft-maca-matcha-vertical-story",
+  "provenance_seed": { "requested_by": "you@example.com", "notes": "why this job exists" }
+}
+```
+
+- `product.fidelity`: `"environment-only"` (default — enforces `ProductLock`, the
+  usual case for a real, labeled product) or `"none"` (explicit opt-out — no guard).
+- `background`, `backend`, `composite`, `provenance_seed` are all optional; asset
+  paths are resolved relative to the repo root, same convention as everywhere else
+  in this repo (`references/products/...`, `logs/...`).
+- **Only `backend: "local_compositor"` runs today.** Any other value — `"arcads"`
+  included — is refused by `run-job` before touching the registry or attempting any
+  network call (see `adapters/job_runner.py`'s `SUPPORTED_BACKENDS_FOR_RUN_JOB`).
+  This is a deliberate Phase 3 boundary, not an oversight: no vendor/network backend
+  is wired into the *job runner* yet, even though `adapters generate --backend arcads`
+  (above) already works for the non-job-manifest skill path.
+
+### QA checks `run-job` runs on every job
+
+1. output file exists and opens as a valid image
+2. dimensions match the requested aspect ratio's canvas
+3. the product source file on disk was not mutated during the run (sha256 before vs. after)
+4. every sha256 recorded in provenance resolves against the actual files on disk
+5. no unexpected overlay: everywhere outside the product's placement box, the output
+   is pixel-identical to an independently recomputed background-only composite — the
+   deterministic proof that nothing (no watermark, caption, or stray draw call) was
+   added beyond "background, cover-fit" + "product, placed"
+6. deterministic rerun: regenerating from the same inputs/params produces byte-identical output
+
+A job is `PASS` only if all six pass; otherwise `FAIL`, with per-check detail in both
+the terminal output and `approval-manifest.json`. A `FAIL` still writes an
+approval-manifest (documenting why) — nothing is silently dropped.
+
+### Approval-ready package layout
+
+```
+<output_dir>/
+  <product-stem>-<aspect>-v1.png   ← the generated asset
+  provenance.json                   ← full record: backend, model, hashes, cost, job/channel, requested_by/notes
+  approval-manifest.json            ← PASS/FAIL, QA detail, pointers — what a human reviews
+```
+
 ## Adding a new backend for real
 
 1. Get the vendor's credentials yourself — this repo (and the assistant) cannot obtain

@@ -10,9 +10,13 @@ Commands:
   compose   — dedicated local_compositor invocation: paste a canonical product
               image onto a supplied background at a standard social aspect ratio.
               Credential-free, deterministic, no network call, ever.
+  run-job   — execute a full creative job manifest end to end: validate, enforce
+              ProductLock, generate via local_compositor, run deterministic QA,
+              write provenance, and produce an approval-ready package. Stops before
+              any publication/distribution step.
 
-See adapters/README.md for full usage and docs/adapter/DESIGN.md § 6 (Phase 2) for
-why this exists.
+See adapters/README.md for full usage, docs/adapter/DESIGN.md § 6 (Phase 2) and § 8
+(Phase 3) for why this exists.
 """
 
 from __future__ import annotations
@@ -23,6 +27,8 @@ import sys
 from pathlib import Path
 
 from adapters.base import GenerationRequest, ProductFidelityViolation, ProductLock
+from adapters.job import JobValidationError, load_job
+from adapters.job_runner import run_job
 from adapters.policy import (
     CostGate,
     ProductFidelityGuard,
@@ -205,6 +211,54 @@ def _cmd_compose(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run_job(args: argparse.Namespace) -> int:
+    job_file = Path(args.job_file)
+    try:
+        job = load_job(job_file)
+    except JobValidationError as e:
+        print(f"error: invalid job manifest: {e}", file=sys.stderr)
+        return 2
+
+    result = run_job(job)
+
+    status_flag = "PASS" if result.status == "PASS" else "FAIL"
+    print(f"{'✓' if status_flag == 'PASS' else '✗'} {status_flag} — job {result.job_id!r}", file=sys.stderr)
+    print(f"  reason            : {result.reason}", file=sys.stderr)
+    print(f"  backend selected  : {result.backend}", file=sys.stderr)
+    print(f"  output path       : {result.output_path or '(none — failed before generation)'}", file=sys.stderr)
+    if result.qa is not None:
+        n_pass = sum(1 for c in result.qa.checks if c.passed)
+        print(
+            f"  QA result         : {'PASS' if result.qa.passed else 'FAIL'} "
+            f"({n_pass}/{len(result.qa.checks)} checks passed)",
+            file=sys.stderr,
+        )
+        for c in result.qa.checks:
+            mark = "ok  " if c.passed else "FAIL"
+            print(f"      [{mark}] {c.name}: {c.detail}", file=sys.stderr)
+    else:
+        print("  QA result         : (not run — failed before generation)", file=sys.stderr)
+    print(f"  provenance path   : {result.provenance_path or '(none)'}", file=sys.stderr)
+    print(f"  approval manifest : {result.approval_manifest_path or '(none)'}", file=sys.stderr)
+
+    print(
+        json.dumps(
+            {
+                "status": result.status,
+                "job_id": result.job_id,
+                "backend": result.backend,
+                "output_path": str(result.output_path) if result.output_path else None,
+                "qa_passed": result.qa.passed if result.qa else None,
+                "provenance_path": str(result.provenance_path) if result.provenance_path else None,
+                "approval_manifest_path": (
+                    str(result.approval_manifest_path) if result.approval_manifest_path else None
+                ),
+            }
+        )
+    )
+    return 0 if result.status == "PASS" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python3 -m adapters")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -252,6 +306,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_compose.add_argument("--position", default="center", choices=["center", "bottom"])
     p_compose.add_argument("--margin", type=float, default=0.08)
     p_compose.set_defaults(func=_cmd_compose)
+
+    p_run_job = sub.add_parser(
+        "run-job",
+        help="execute a full creative job manifest: validate, QA, provenance, approval package",
+    )
+    p_run_job.add_argument("job_file", help="path to a job manifest JSON file, e.g. jobs/<name>.json")
+    p_run_job.set_defaults(func=_cmd_run_job)
 
     return parser
 
