@@ -1,0 +1,274 @@
+# Vendor-neutral Operations OS adaptation — design doc
+
+Status: Phase 0 (substrate only, no backend rewiring). Branch: `feature/vendor-neutral-adapter-layer`.
+
+This repo (`arcads-claude-code`) currently ships a terminal-first, Claude-Code-driven
+creative-production workflow that is hardwired to one vendor: Arcads
+(`https://external-api.arcads.ai`). We do not have an Arcads subscription today. This
+doc audits what's actually vendor-specific vs. reusable, and proposes the smallest safe
+adapter layer that lets skills route to OpenAI, Runway, Remotion, Canva, Descript, or a
+future Arcads key — without rewriting the skills themselves or deleting anything that
+works today.
+
+## 1. Architecture map
+
+```
+arcads-claude-code/
+├── CLAUDE.md, AGENTS.md, README.md      — agent instructions + human docs (generated
+│                                          from *.tail.md fragments; DO NOT EDIT headers)
+├── .claude/, .cursor/                   — generated skill copies (gitignored), synced
+│                                          from skills/ + shared/skills/ by sync-skill.sh
+├── .claude/settings.json                — SessionStart hook: sync-skill.sh + check-context.sh
+├── scripts/                             — repo-root setup/check/sync scripts
+│   ├── setup.sh                         — writes .env, MASTER_CONTEXT.md, validates auth
+│   ├── check-arcads-env.sh              — GET /v1/products smoke test
+│   └── sync-skill.sh                    — thin wrapper → shared/scripts/sync-skill.sh
+├── shared/                              — content propagated from an upstream
+│   │                                      "gen-ai-core" monorepo (per in-file comments);
+│   │                                      treat as vendored/upstream-owned, not ours to
+│   │                                      restructure — new code should NOT live here.
+│   ├── scripts/{sync-skill.sh,check-context.sh}
+│   ├── skills/image-ad-prompting/       — shared brain: 37-template prompt library,
+│   │                                      safety suffixes, template format (no SKILL.md
+│   │                                      → not independently invocable, referenced by
+│   │                                      the 3 image-ad skills below)
+│   ├── skills/{pixar-style-ad,claymation-ad,caption-video,gemini-omni-flash}/
+│   │                                    — cross-API prompting guides + a few scripts
+│   │                                      (caption-video is already vendor-neutral:
+│   │                                      HyperFrames + Whisper + ffmpeg, no Arcads calls)
+│   └── skills/meta-ad-builder/          — the ONE downstream skill that is genuinely
+│                                          vendor-neutral already: talks to Meta's
+│                                          Graph API, not Arcads. Takes a finished file
+│                                          path as input; doesn't care how it was made.
+├── skills/                              — canonical Arcads-specific skills (source of
+│   │                                      truth; synced into .claude/ and .cursor/)
+│   ├── arcads-external-api/             — THE core skill: full Arcads API surface,
+│   │                                      per-model prompt libraries, polling rules
+│   ├── chatgpt-image-ad/scripts/generate_image.py   — Arcads /v2/images/generate,
+│   │                                      model locked to gpt-image-2
+│   ├── nano-banana-image-ad/scripts/generate_image.py — same endpoint, nano-banana family
+│   ├── image-ad-clone/                  — reverse-engineer an ad → library entry;
+│   │                                      routes to one of the two scripts above
+│   └── generate-youtube-thumbnail/scripts/generate-batch.sh — Arcads batch bash script
+├── references/                          — local-only (gitignored) reference images:
+│                                          influencers/, products/, aesthetics/
+├── logs/arcads-api.jsonl                — append-only per-call cost/provenance log
+└── MASTER_CONTEXT.template.md           — workspace memory template (credit costs,
+                                            brand voice, per-API "Project snapshot" block)
+```
+
+**Execution model:** there is no application code that "runs" — the repo is a set of
+Markdown SKILL.md files (read by the Claude Code / Cursor agent as instructions) plus a
+handful of small scripts the agent shells out to. The agent is the orchestrator: it
+reads a SKILL.md, decides which script/endpoint to hit, asks the user for approval
+gates (dialogue, cost, product choice), calls a script or curl command, polls, runs
+visual QA on the result, and writes a log line. All the *process* (approval gates,
+retry caps, QA, session folders, cost estimation, provenance logging) lives in prose
+inside SKILL.md files — it is enforced by agent instruction-following, not by code.
+
+## 2. Dependency map — every Arcads-specific touch point
+
+| Kind | Where | Detail |
+|---|---|---|
+| **API base URL** | `skills/arcads-external-api/{SKILL.md,reference.md}`, both image-ad `generate_image.py` scripts, `scripts/check-arcads-env.sh`, `.env.example` | `https://external-api.arcads.ai`, overridable via `ARCADS_BASE_URL` |
+| **Credentials** | `.env.example`, `scripts/setup.sh`, `scripts/check-arcads-env.sh`, both `generate_image.py` `auth_header()` fns | `ARCADS_BASIC_AUTH` (pre-encoded `Basic ...`) or `ARCADS_API_KEY` (Basic username, empty password) |
+| **Endpoints** | `skills/arcads-external-api/reference.md` | `POST /v2/videos/generate`, `POST /v2/images/generate` (note inconsistent case: `/V2/` also documented), `POST /v1/b-roll`, `POST /v1/scene`, `POST /v1/sora2/remix/video`, `GET /v1/videos/{id}`, `GET /v1/assets/{id}`, `POST /v1/file-upload/get-presigned-url`, `POST /v1/products`, `GET /v1/products`, `POST /v1/folders`, `GET /v1/products/{id}/folders`, `POST /v1/projects`, `POST /v1/assets/add-to-project`, `POST /v1/scripts`, `POST /v1/scripts/{id}/generate`, `POST /v1/omnihuman`, `POST /v1/audio-driven` |
+| **Model identifiers** | reference.md, prompt-library files | `seedance-2.0`, `sora2`/`sora2-pro`, `veo31`, `kling-2.6`/`kling-3.0`, `grok-video`, `nano-banana`/`nano-banana-2`/`nano-banana-edit`, `gpt-image-2` (Arcads' proxied name — NOT the same as calling OpenAI directly), `soul`, `grok_image`, `seedream`/`seedream_5_lite` |
+| **Executable scripts (hard dependency)** | `skills/chatgpt-image-ad/scripts/generate_image.py`, `skills/nano-banana-image-ad/scripts/generate_image.py`, `skills/generate-youtube-thumbnail/scripts/generate-batch.sh` | All three hardcode `BASE_URL_DEFAULT = "https://external-api.arcads.ai"`, the presigned-upload flow, and `/v2/images/generate` / `/V2/images/generate` request shape. `image-ad-clone` has no script of its own — it *depends on* the two generator scripts above being present. |
+| **Config/env** | `.env.example` | `ARCADS_BASIC_AUTH`, `ARCADS_API_KEY`, `ARCADS_CLIENT_ID`, `ARCADS_BASE_URL`, `PRODUCT_ID`/`PROJECT_ID` (read by the image-ad scripts from env, not `.env.example`, but conventionally Arcads product/project UUIDs) |
+| **Setup/check scripts** | `scripts/setup.sh`, `scripts/check-arcads-env.sh` | Both validate against `$BASE_URL/v1/products`; setup.sh's credential-probing logic is Arcads-Basic-auth-specific |
+| **Session/org model** | `skills/arcads-external-api/SKILL.md` "Session setup" section | Arcads' own folder/project hierarchy (`POST /v1/folders`, `POST /v1/projects`) — a dashboard-organization concept specific to Arcads, not a generic file-organization pattern |
+| **Cost model** | `skills/arcads-external-api/SKILL.md` "Credit cost estimation", `logs/arcads-api.jsonl`, `logs/README.md`, `MASTER_CONTEXT.template.md` "Credit costs" table | Arcads' proprietary "credits" unit; no billing endpoint exists, so the whole cost story is agent-side log-mining |
+| **Product-context API** | reference.md "Product context via ProductCreationDto" | Arcads product objects carry marketing metadata (`targetAudience`, `mainFeatures`, etc.) referenced by `productId` in every call |
+| **Affiliate/signup links** | `skills/arcads-external-api/SKILL.md` "Signup link (affiliate)", README.md, AGENTS.md | `https://arcads.ai/?via=claude-code` — promotional, not technical |
+| **Branding / promo content** | README.md (Skool community, walkthrough video, "Mr. Paid Social"), `shared/CLAUDE.md` "surface the community" section, AGENTS.md same section | Non-technical; safe to ignore for the adapter but should not be deleted (out of scope; it's the author's monetization, not a technical dependency) |
+| **Meta-ad-builder** | `shared/skills/meta-ad-builder/` | **Not** an Arcads dependency — talks to `graph.facebook.com` directly, takes a finished file path. Already vendor-neutral at the input boundary. |
+| **Caption-video** | `shared/skills/caption-video/` | **Not** an Arcads dependency — HyperFrames + Whisper + ffmpeg on a finished mp4. Already vendor-neutral. |
+
+**Cross-API awareness already exists.** `shared/skills/pixar-style-ad/prompting/guide.md`
+and its claymation sibling already carry a "Per-API endpoint notes (KIE vs Arcads)"
+table — this repo's authors already anticipated a second backend (KIE.ai) at the
+prompting-guide layer, just not as a runtime abstraction. That table is useful prior
+art for the adapter's per-backend field-mapping documentation.
+
+## 3. Four-way split
+
+**A. Reusable vendor-neutral concepts/patterns** (keep, generalize, formalize as the adapter contract)
+- Still-before-video approval gate (`SKILL.md` "influencer recreation" / "product showcase" two-step flows)
+- Bounded QA retry loop (2 retries / 3 attempts total, on stills)
+- Mandatory cost-estimate-then-confirm gate, with a documented "QA-fix retries skip re-confirmation but still bill" exception
+- Mandatory dialogue-approval gate (separate from cost gate) for any video with speech
+- Provenance logging pattern (`logs/*.jsonl`, append-at-request / update-at-completion, never logging secrets or full prompt text)
+- Reference-image auto-upscale-to-1024px + RGB-JPEG normalization before submission
+- Session-scoped dated output organization (generalizes past Arcads' folder/project API to "just use a dated local output directory" for any backend)
+- "Never batch chat-pasted images — require files on disk" rule
+- Safety suffixes pattern (`NO_CHROME_SUFFIX`, `SAFE_ZONE_SUFFIX`, `GLYPH_SAFETY_SUFFIX`) — these are prompt-engineering guards, not Arcads API mechanics; portable to any image backend
+- Brand-contract-locked generator scripts (one script = one model family, refuses `--model` overrides) — good pattern to keep per-backend
+
+**B. Reusable prompting/creative knowledge** (vendor-neutral content, keep as-is)
+- `shared/skills/image-ad-prompting/prompting/prompt-library.md` (37 templates) + `template-format.md` + `safety-suffixes.md`
+- `skills/arcads-external-api/prompting/prompt-library/*.md` — the per-model formulas (UGC, premium reveal, product hero, studio lookbook, feature walkthrough, character sheet, ugc-product-selfie) describe *what to say to a generative model*, not *how to call Arcads*. These formulas are directly reusable prompt text for OpenAI/Runway/etc., even though today's file also embeds Arcads field names in the "how to submit" sections.
+- `shared/skills/pixar-style-ad/`, `shared/skills/claymation-ad/` guides — the cast-sheet, beat-structure, and continuity methodology is 90% vendor-neutral; only the "Per-API endpoint notes" tables are Arcads/KIE-specific
+- `shared/skills/generate-youtube-thumbnail/prompting/{guide.md,formulas.md}` — likeness-lock and CTR formulas
+- `shared/skills/caption-video/prompting/guide.md` — fully vendor-neutral already (no generative-API calls at all)
+- `MASTER_CONTEXT.template.md` "Universal prompting principles" section — explicitly already labeled universal
+
+**C. Arcads-specific execution code** (isolate behind the adapter, do not delete)
+- `skills/chatgpt-image-ad/scripts/generate_image.py`, `skills/nano-banana-image-ad/scripts/generate_image.py`
+- `skills/generate-youtube-thumbnail/scripts/generate-batch.sh`
+- `skills/arcads-external-api/**` (SKILL.md, reference.md, all endpoint/model mechanics)
+- `scripts/setup.sh`, `scripts/check-arcads-env.sh`
+- `.env.example` Arcads block, `logs/arcads-api.jsonl` schema (Arcads-specific fields like `creditsCharged`)
+
+**D. Promotional/community/nonessential material** (leave untouched; out of scope for a technical adaptation)
+- README.md walkthrough video + Skool community sections, AGENTS.md/CLAUDE.md "surface the community" trigger rules, the `?via=claude-code` affiliate link, `shared/CLAUDE.md` community section
+
+## 4. Proposed adapter design
+
+### 4.1 Principle
+
+Skills stay the interface the *agent* reads (SKILL.md prose). What changes is that the
+"how do I actually generate this asset" step becomes a call through a small,
+stdlib-only Python contract (`adapters/`) instead of a hardcoded `curl
+external-api.arcads.ai` or a fixed script path. A skill's SKILL.md says "call the
+adapter with these parameters"; the adapter decides which backend handles it based on
+what's configured, and every backend implementation returns the same result shape so
+downstream steps (QA, provenance logging, cost display) don't change per backend.
+
+### 4.2 Interface (`adapters/base.py`)
+
+```python
+class CreativeBackend(ABC):
+    name: str
+    def capabilities(self) -> set[Capability]: ...          # {IMAGE, IMAGE_EDIT, VIDEO, VIDEO_EDIT}
+    def check_credentials(self) -> CredentialStatus: ...     # never raises; ok/why-not
+    def estimate_cost(self, request: GenerationRequest) -> CostEstimate | None: ...
+    def generate(self, request: GenerationRequest) -> list[GenerationResult]: ...
+```
+
+`GenerationRequest` carries: kind, prompt, aspect_ratio, references (paths),
+source (path, for edits), `product_lock` (see §4.4), n, output_dir. `GenerationResult`
+carries: variant, path, backend name, model, cost estimate + currency (backend-native
+unit — credits, USD, or `None` if unknown), and a `provenance` dict (backend, model,
+timestamp, sha256 of inputs/outputs, prompt hash — never the raw prompt or credentials).
+
+### 4.3 Cross-cutting policy (`adapters/policy.py`) — backend-independent, enforced once
+
+- `RetryPolicy` — bounded QA-fix retries (default cap 2, matching the existing Arcads rule)
+- `CostGate` — must be satisfied (explicit user confirmation) before first generation;
+  QA-fix retries are exempt but still counted/logged
+- `require_still_before_video(...)` — refuses to build a video request whose source
+  frame lacks an approved still result
+- `ProductFidelityGuard` — see §4.4
+- `write_provenance(result, log_path)` — appends one JSON line per result, generalizing
+  today's `logs/arcads-api.jsonl` convention to `logs/adapter-calls.jsonl` with a
+  backend-agnostic schema (superset covers Arcads' `creditsCharged` as one possible
+  `cost.amount` + `cost.unit="credits"`)
+
+### 4.4 Product-fidelity hard rule
+
+Per the user's requirement: when packaging/label/logo/SKU text must render exactly,
+canonical product pixels must be preserved — never regenerated from a text prompt.
+
+`GenerationRequest.product_lock: ProductLock | None` where:
+
+```python
+@dataclass
+class ProductLock:
+    canonical_image: Path       # the real product photo — pixels of the product must survive
+    mode: Literal["environment-only"]  # only mode supported in phase 1
+```
+
+`ProductFidelityGuard.check(request)`:
+- If `product_lock` is set, the request MUST be routed through a backend capability
+  that supports `IMAGE_EDIT` (inpaint/compose around a fixed region), never plain
+  `IMAGE` (full text-to-image regeneration). If the chosen backend/mode can't do that,
+  the guard raises `ProductFidelityViolation` rather than silently falling back to
+  full regeneration.
+- This encodes exactly the rule already implicit in the Arcads skill's `image_edit`
+  mode / `--source` flag (chatgpt-image-ad, nano-banana-image-ad already have this
+  mode) — the guard just makes it mandatory-by-construction instead of
+  optional-by-convention when a canonical product image exists in
+  `references/products/`.
+
+### 4.5 Backend registry (`adapters/registry.py`)
+
+```python
+BACKENDS: dict[str, type[CreativeBackend]] = {
+    "arcads": ArcadsBackend,        # REAL — wraps the existing, tested generate_image.py scripts
+    "openai": OpenAIBackend,        # STUB — capabilities declared, generate() raises NotImplementedError
+    "runway": RunwayBackend,        # STUB
+    "remotion": RemotionBackend,    # STUB
+    "canva": CanvaBackend,          # STUB
+    "descript": DescriptBackend,    # STUB
+}
+```
+
+`ArcadsBackend` is a thin wrapper that shells out to the two existing
+`generate_image.py` scripts (subprocess, same as a human would run them) — it does
+**not** reimplement the Arcads HTTP calls, so there is exactly one place that owns
+Arcads request-building (the existing scripts), and the adapter can't drift from it.
+
+The five other backends are **honest stubs**: `check_credentials()` correctly reports
+what env var is missing and that no execution path exists yet; `generate()` raises
+`NotImplementedError` with a message naming the missing implementation. This is
+intentional — this repo has no OpenAI/Runway/Remotion/Canva/Descript credentials or
+tested request-building logic, and inventing one without the ability to test it against
+real endpoints (no billable calls allowed) would violate "don't claim a backend is
+automated unless there's a real executable path." Wiring each stub to a real,
+tested implementation is future work, one backend at a time, each gated on the user
+actually having that vendor's credentials to validate against.
+
+## 5. Risks
+
+1. **Two sources of truth during migration.** Until skills are updated to call the
+   adapter instead of the hardcoded scripts directly, `adapters.ArcadsBackend` and a
+   human/agent invoking `generate_image.py` directly are two paths to the same place.
+   Mitigated by `ArcadsBackend` calling the *same* script rather than reimplementing it.
+2. **Shared/ is upstream-owned.** Several comments in this repo state `shared/` is
+   propagated from an external `gen-ai-core` repo by an out-of-repo `propagate.sh`.
+   Editing `shared/skills/*` risks silent overwrite on the next upstream sync. The
+   adapter layer therefore lives at the repo root (`adapters/`), not under `shared/`.
+3. **Stub backends could be mistaken for working ones.** Mitigated by `NotImplementedError`
+   at the one call site (`generate()`) plus `check_credentials()` reporting `ok=False`
+   up front, plus this doc and the adapter README stating plainly that only Arcads has
+   an executable path today.
+4. **Cost model isn't backend-portable.** Arcads' "credits" have no fixed USD
+   conversion; OpenAI/Runway are usually USD or token-metered. `CostEstimate` carries
+   an explicit `unit` field and the cost gate always shows the unit — never silently
+   normalizes currencies.
+5. **Aspect ratio / duration / reference-count limits differ per vendor** (already true
+   between Arcads' three image models, per `reference.md`). The adapter does not
+   attempt a universal capability matrix in phase 1 — each backend's `capabilities()`
+   and its own validation own that; cross-backend portability of a specific prompt
+   template remains a per-template documentation exercise (as the image-ad-prompting
+   library already does for gpt-image-2 vs nano-banana).
+6. **No test coverage for the real Arcads path without a subscription.** `ArcadsBackend`
+   is exercised in this phase only with argument-construction / dry-path unit tests
+   (no network), consistent with "make no billable calls." End-to-end validation
+   against a live Arcads account is deferred to whoever next has a key.
+
+## 6. Acceptance criteria
+
+**Phase 1 (this change):**
+- [ ] `adapters/` package exists at repo root with `base.py`, `policy.py`,
+      `registry.py`, one real backend (`arcads_backend.py`), five honest stub backends.
+- [ ] No network calls anywhere in `adapters/` or its tests — verified by running the
+      test suite offline.
+- [ ] `ArcadsBackend` does not duplicate Arcads HTTP logic; it shells out to the
+      existing `skills/*/scripts/generate_image.py` scripts unchanged.
+- [ ] Product-fidelity guard is enforced in code (raises on violation), not just
+      documented in prose.
+- [ ] No existing file under `skills/` or `shared/` is modified or deleted — this phase
+      is purely additive.
+- [ ] Tests pass via `python3 -m unittest discover adapters/tests -v`.
+- [ ] This doc + `adapters/README.md` explain, per backend, exactly what credential(s)
+      would be needed and what remains unimplemented.
+
+**Future phases (not in this change):**
+- [ ] At least one skill's SKILL.md updated to call `adapters.registry` instead of a
+      hardcoded script path, with the Arcads path behaviorally unchanged end-to-end.
+- [ ] One additional backend (user's choice — likely OpenAI, since product-fidelity
+      editing via `images/edits` is closest to already-documented `image_edit` mode)
+      implemented and validated by the user against their own credentials/spend.
+- [ ] `logs/adapter-calls.jsonl` schema adopted by at least one live skill run.
