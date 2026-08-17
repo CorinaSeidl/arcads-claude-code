@@ -452,3 +452,62 @@ the automated regression test. Evidence preserved under `outputs/jobs/` (gitigno
 - `run-job` always uses `n=1`; multi-variant job manifests (e.g. "give me 3 crops of
   this campaign") aren't supported and would need either a `variants` array in the
   manifest or a loop at the CLI layer.
+
+## 9. Independent-review fixes (commit 9da30e5 findings)
+
+An independent review of Phase 3 (commit `9da30e5`) found two reproducible blocking
+defects and several non-blocking hardening gaps. Fixes:
+
+**B1 — manifest path containment (`adapters/job.py`).** `load_job()` previously
+joined manifest-supplied paths onto `repo_root` with no normalization or containment
+check; a manifest with `output_dir: "../../../../tmp/x"` wrote real files outside the
+repo. `_resolve_contained()` now: rejects absolute manifest paths outright (portable
+jobs shouldn't reference an operator's local filesystem layout); fully canonicalizes
+relative paths with `.resolve()` (normalizes `..`, follows symlinks); and rejects
+(never silently re-roots) anything that resolves outside `repo_root`. Applied to
+`product.asset`, `background.asset`, and `output_dir` — the only three
+manifest-derived filesystem paths that exist today. A rejected manifest raises before
+`run_job()` is ever called, so no filesystem artifact — inside or outside the repo —
+is created at all.
+
+**B2 — crash-safe approval state (`adapters/job_runner.py`, `adapters/atomic.py`).**
+`run_job()` had no exception containment around QA/provenance/manifest-write, and no
+atomicity — an exception in that window could leave a stale `PASS` describing an
+image the current run never validated (reproduced by the review). Fixed with an
+explicit `RUNNING -> PASS | FAIL` lifecycle: any prior terminal state is overwritten
+with `RUNNING` (atomically, via `adapters/atomic.py`'s temp-file-plus-`os.replace`)
+*before* `generate()` runs, and every subsequent stage (generate, QA, provenance,
+final manifest write) is individually wrapped so an exception there durably records
+`FAIL` instead of leaving the previous state in place. The `JobResult` returned to
+the caller is always in sync with what's on disk — a caller is only told `PASS` if
+`approval-manifest.json` was atomically written with status `PASS`; if that specific
+write fails, the result is `FAIL` even though QA passed, because nothing durable
+says otherwise.
+
+**N1 — `ProductFidelityGuard` source identity (`adapters/policy.py`).** The guard
+checked that a locked file exists and the routing is capability-appropriate, but
+never that `product_lock.canonical_image` is the same file as `request.source` — the
+review constructed a request where they diverged and the guard passed. Now compares
+resolved identity and raises `ProductFidelityViolation` on mismatch.
+
+**N2 — provenance/log hygiene.** `logs/adapter-calls.jsonl` had accumulated
+leftover test-pollution entries (from before an earlier fix) and, in the `run-job`
+path, absolute local-machine paths (leaking the operator's home directory) instead
+of the repo-relative convention every other log in this repo uses. Cleaned the
+committed log to its one legitimate entry; `job_runner.py` now records
+repo-relative paths (`_display_path()`) in `provenance.json`/`approval-manifest.json`/
+the shared log wherever the path is actually under the repo (CLI-driven `compose`/
+`generate` paths, which can legitimately point anywhere the operator chooses, are
+unaffected). `jobs/soulcraft-maca-matcha.json`'s example `requested_by` was changed
+from a real address to the placeholder `adapters/README.md` already documents.
+`adapters/tests/test_log_hygiene.py` adds a regression guard that spawns the full
+suite as a child process and asserts the committed log's hash is unchanged.
+
+**N4 — `ArcadsBackend.generate()` happy-path coverage.** Every existing test that
+touched `subprocess.run` only asserted it was *not* called (guard-rejection paths);
+the actual argv-construction and stdout-parsing logic — the whole reason this backend
+exists — had no direct coverage.
+`adapters/tests/test_arcads_backend.py::TestGenerateHappyPathMocked` mocks
+`subprocess.run` with realistic stdout and asserts argv shape (script selection,
+flags, values), multi-variant/reference handling, and the returncode 2 / empty-stdout-1
+/ partial-stdout-1 / malformed-JSON behaviors. No real Arcads call.

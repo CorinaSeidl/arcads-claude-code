@@ -136,6 +136,41 @@ class TestProductFidelityGuard(unittest.TestCase):
             backend = _FakeBackend(frozenset({Capability.IMAGE_EDIT}))
             ProductFidelityGuard.check(backend, req)  # should not raise
 
+    def test_raises_when_source_does_not_match_canonical_image(self) -> None:
+        """Review-fix N1: the lock only protects anything if the file it names is
+        actually the file being operated on — must not rely on caller convention."""
+        with tempfile.TemporaryDirectory() as d:
+            real_product = Path(d) / "real.jpg"
+            decoy = Path(d) / "decoy.jpg"
+            real_product.write_bytes(b"real-product-bytes")
+            decoy.write_bytes(b"totally-different-bytes")
+            req = GenerationRequest(
+                kind="image_edit",
+                prompt="p",
+                source=decoy,  # what the backend will actually operate on
+                product_lock=ProductLock(canonical_image=real_product),  # what's "protected"
+            )
+            backend = _FakeBackend(frozenset({Capability.IMAGE_EDIT}))
+            with self.assertRaises(ProductFidelityViolation):
+                ProductFidelityGuard.check(backend, req)
+
+    def test_passes_when_source_and_canonical_image_are_equal_but_different_path_objects(self) -> None:
+        """Same file referenced via two distinct (but equal-after-resolve) Path
+        strings must still pass — the identity check compares resolved identity, not
+        object identity or literal string equality."""
+        with tempfile.TemporaryDirectory() as d:
+            product = Path(d) / "product.jpg"
+            product.write_bytes(b"x")
+            source_path = Path(d) / "." / "product.jpg"  # same file, different spelling
+            req = GenerationRequest(
+                kind="image_edit",
+                prompt="p",
+                source=source_path,
+                product_lock=ProductLock(canonical_image=product),
+            )
+            backend = _FakeBackend(frozenset({Capability.IMAGE_EDIT}))
+            ProductFidelityGuard.check(backend, req)  # should not raise
+
 
 class TestProvenance(unittest.TestCase):
     def test_build_provenance_hashes_output_and_prompt(self) -> None:

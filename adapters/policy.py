@@ -109,6 +109,25 @@ class ProductFidelityGuard:
                 "product-locked requests must use kind='image_edit' with "
                 "source=product_lock.canonical_image, never plain text-to-image."
             )
+        # Identity check (review-fix N1): a ProductLock only protects anything if the
+        # file it names is actually the file the backend is about to operate on. Don't
+        # rely on callers keeping product_lock.canonical_image and request.source in
+        # sync by convention — verify it here, once, for every caller.
+        if request.source is None:
+            raise ProductFidelityViolation(
+                "product_lock is set but request.source is None — there is nothing "
+                "to verify the lock against, so this request cannot be trusted to "
+                "preserve the locked product's pixels."
+            )
+        locked = request.product_lock.canonical_image.resolve()
+        actual = request.source.resolve()
+        if locked != actual:
+            raise ProductFidelityViolation(
+                f"product_lock.canonical_image ({locked}) does not match request.source "
+                f"({actual}) — the request claims to protect a different file than the "
+                "one it would actually operate on. Refusing rather than trusting caller "
+                "convention to keep these in sync."
+            )
 
 
 def sha256_of(path: Path) -> str | None:

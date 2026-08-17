@@ -94,15 +94,47 @@ class CreativeJob:
         )
 
 
+class PathContainmentError(JobValidationError):
+    """Raised when a manifest-controlled path is absolute or escapes the repo root."""
+
+
 def _require(data: dict, key: str, job_file: Path) -> object:
     if key not in data:
         raise JobValidationError(f"{job_file}: missing required field {key!r}")
     return data[key]
 
 
-def _resolve(raw_path: str, repo_root: Path) -> Path:
+def _resolve_contained(raw_path: str, repo_root: Path, field_name: str, job_file: Path) -> Path:
+    """Resolve a manifest-supplied path and require it to land under repo_root.
+
+    Policy (see docs/adapter/DESIGN.md, review-fix B1):
+    - Absolute paths are forbidden outright — job manifests must be portable and
+      self-contained, never reference an operator's local filesystem layout.
+    - Relative paths are joined onto repo_root and fully canonicalized with
+      ``resolve()`` (which normalizes ``..`` components AND follows symlinks), then
+      checked against the resolved repo root. Anything that escapes — via ``..``,
+      a symlink, or any other normalization — is rejected outright.
+    - Never silently clamp/rewrite an escaping path into a safe one; always raise.
+    """
     p = Path(raw_path)
-    return p if p.is_absolute() else (repo_root / p)
+    if p.is_absolute():
+        raise PathContainmentError(
+            f"{job_file}: {field_name} must be a repo-relative path — absolute paths "
+            f"are forbidden in job manifests (got {raw_path!r}). This keeps manifests "
+            "portable and prevents a manifest from reading/writing an arbitrary "
+            "location on whichever machine happens to run it."
+        )
+    root_resolved = repo_root.resolve()
+    candidate = (root_resolved / p).resolve()
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError:
+        raise PathContainmentError(
+            f"{job_file}: {field_name} {raw_path!r} resolves outside the repository "
+            f"root ({candidate} is not under {root_resolved}) — refusing rather than "
+            "silently containing it. Fix the manifest path."
+        ) from None
+    return candidate
 
 
 def load_job(job_file: Path, repo_root: Path | None = None) -> CreativeJob:
@@ -112,6 +144,11 @@ def load_job(job_file: Path, repo_root: Path | None = None) -> CreativeJob:
     (defaults to this repo's root) — the same convention every other path in this
     repo already uses (references/products/..., logs/..., etc.), not the manifest
     file's own directory.
+
+    Every path field (product.asset, background.asset, output_dir) is required to be
+    repo-relative and is rejected outright — not silently re-contained — if it's
+    absolute or resolves (after normalizing ``..`` and following symlinks) outside
+    repo_root. See _resolve_contained() / PathContainmentError.
     """
     root = repo_root or _REPO_ROOT
     if not job_file.exists():
@@ -136,7 +173,10 @@ def load_job(job_file: Path, repo_root: Path | None = None) -> CreativeJob:
         raise JobValidationError(
             f"{job_file}: product.fidelity must be one of {sorted(_VALID_FIDELITY)}, got {fidelity!r}"
         )
-    product = ProductSpec(asset=_resolve(product_raw["asset"], root), fidelity=fidelity)
+    product = ProductSpec(
+        asset=_resolve_contained(product_raw["asset"], root, "product.asset", job_file),
+        fidelity=fidelity,
+    )
 
     background = None
     background_raw = data.get("background")
@@ -145,7 +185,9 @@ def load_job(job_file: Path, repo_root: Path | None = None) -> CreativeJob:
             raise JobValidationError(
                 f"{job_file}: 'background' must be an object with an 'asset' field, or omitted"
             )
-        background = BackgroundSpec(asset=_resolve(background_raw["asset"], root))
+        background = BackgroundSpec(
+            asset=_resolve_contained(background_raw["asset"], root, "background.asset", job_file)
+        )
 
     backend = data.get("backend", "local_compositor")
 
@@ -171,7 +213,7 @@ def load_job(job_file: Path, repo_root: Path | None = None) -> CreativeJob:
         channel=str(channel),
         product=product,
         aspect_ratio=str(aspect_ratio),
-        output_dir=_resolve(str(output_dir_raw), root),
+        output_dir=_resolve_contained(str(output_dir_raw), root, "output_dir", job_file),
         background=background,
         backend=str(backend),
         composite=composite,

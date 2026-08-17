@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from adapters.job import CreativeJob, JobValidationError, load_job
+from adapters.job import CreativeJob, JobValidationError, PathContainmentError, load_job
 
 
 def _write(d: Path, name: str, data: dict) -> Path:
@@ -33,28 +33,128 @@ class TestLoadJobHappyPath(unittest.TestCase):
             root = Path(d)
             manifest = _write(root, "job.json", _minimal_manifest())
             job = load_job(manifest, repo_root=root)
+            root_resolved = root.resolve()
             self.assertIsInstance(job, CreativeJob)
             self.assertEqual(job.job_id, "test-job")
             self.assertEqual(job.channel, "instagram_story")
-            self.assertEqual(job.product.asset, root / "references/products/x.jpg")
+            self.assertEqual(job.product.asset, root_resolved / "references/products/x.jpg")
             self.assertEqual(job.product.fidelity, "environment-only")
-            self.assertEqual(job.background.asset, root / "outputs/demo/bg.png")
+            self.assertEqual(job.background.asset, root_resolved / "outputs/demo/bg.png")
             self.assertEqual(job.aspect_ratio, "9:16")
-            self.assertEqual(job.output_dir, root / "outputs/jobs/test-job")
+            self.assertEqual(job.output_dir, root_resolved / "outputs/jobs/test-job")
             self.assertEqual(job.backend, "local_compositor")  # default
             self.assertEqual(job.composite.mode, "fit")  # default
+            # Every resolved path must actually be contained under repo_root.
+            for p in (job.product.asset, job.background.asset, job.output_dir):
+                self.assertTrue(p.is_relative_to(root_resolved), p)
 
-    def test_absolute_asset_paths_are_not_re_rooted(self) -> None:
+    def test_absolute_asset_paths_are_rejected(self) -> None:
+        # Review-fix B1: absolute manifest paths are forbidden outright (portability +
+        # containment), never silently accepted or re-rooted.
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            abs_product = (root / "elsewhere" / "product.jpg")
+            abs_product = root / "elsewhere" / "product.jpg"
             manifest = _write(
                 root,
                 "job.json",
                 _minimal_manifest(product={"asset": str(abs_product), "fidelity": "none"}),
             )
+            with self.assertRaises(PathContainmentError):
+                load_job(manifest, repo_root=root)
+
+    def test_absolute_background_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            manifest = _write(
+                root, "job.json", _minimal_manifest(background={"asset": "/etc/hosts"})
+            )
+            with self.assertRaises(PathContainmentError):
+                load_job(manifest, repo_root=root)
+
+    def test_absolute_output_dir_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            manifest = _write(root, "job.json", _minimal_manifest(output_dir="/tmp/somewhere"))
+            with self.assertRaises(PathContainmentError):
+                load_job(manifest, repo_root=root)
+
+    def test_dotdot_escaping_output_dir_is_rejected_and_creates_nothing(self) -> None:
+        # Both temp dirs land as siblings under the same system temp root, so "../{name}"
+        # relative to `root` genuinely resolves to `canary_parent` — a real escape attempt.
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as canary_dir:
+            root = Path(d)
+            canary_parent = Path(canary_dir)
+            canary = canary_parent / "escaped-output"
+            manifest = _write(
+                root,
+                "job.json",
+                _minimal_manifest(output_dir=f"../{canary_parent.name}/escaped-output"),
+            )
+            with self.assertRaises(PathContainmentError):
+                load_job(manifest, repo_root=root)
+            self.assertFalse(canary.exists(), "escaping path must not create anything")
+
+    def test_dotdot_escaping_product_asset_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            manifest = _write(
+                root,
+                "job.json",
+                _minimal_manifest(product={"asset": "../../../../../../etc/hosts", "fidelity": "none"}),
+            )
+            with self.assertRaises(PathContainmentError):
+                load_job(manifest, repo_root=root)
+
+    def test_nested_repo_relative_paths_still_work(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            manifest = _write(
+                root,
+                "job.json",
+                _minimal_manifest(
+                    product={"asset": "references/products/sub/dir/x.jpg", "fidelity": "none"},
+                    output_dir="outputs/jobs/nested/deeply/here",
+                ),
+            )
             job = load_job(manifest, repo_root=root)
-            self.assertEqual(job.product.asset, abs_product)
+            root_resolved = root.resolve()
+            self.assertEqual(
+                job.product.asset, root_resolved / "references/products/sub/dir/x.jpg"
+            )
+            self.assertEqual(job.output_dir, root_resolved / "outputs/jobs/nested/deeply/here")
+
+    @unittest.skipUnless(hasattr(Path, "symlink_to"), "platform lacks symlink support")
+    def test_symlink_escape_in_output_dir_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside_dir:
+            root = Path(d)
+            outside = Path(outside_dir)
+            link = root / "escape-link"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported in this environment")
+            manifest = _write(root, "job.json", _minimal_manifest(output_dir="escape-link/out"))
+            with self.assertRaises(PathContainmentError):
+                load_job(manifest, repo_root=root)
+            self.assertFalse((outside / "out").exists(), "escaping via symlink must not create anything")
+
+    @unittest.skipUnless(hasattr(Path, "symlink_to"), "platform lacks symlink support")
+    def test_symlink_escape_in_product_asset_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside_dir:
+            root = Path(d)
+            outside = Path(outside_dir)
+            secret = outside / "secret.jpg"
+            secret.write_bytes(b"outside-the-repo")
+            link = root / "product-link.jpg"
+            try:
+                link.symlink_to(secret)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported in this environment")
+            manifest = _write(
+                root, "job.json", _minimal_manifest(product={"asset": "product-link.jpg", "fidelity": "none"})
+            )
+            with self.assertRaises(PathContainmentError):
+                load_job(manifest, repo_root=root)
 
     def test_defaults_applied_when_optional_fields_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as d:

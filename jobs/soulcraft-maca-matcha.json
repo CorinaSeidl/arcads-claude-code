@@ -17,7 +17,7 @@
   },
   "output_dir": "outputs/jobs/soulcraft-maca-matcha-vertical-story",
   "provenance_seed": {
-    "requested_by": "hello@soulcraftapotheca.com",
+    "requested_by": "you@example.com",
     "notes": "Vertical Instagram Story creative for the maca matcha launch. Local compositor smoke test — no generative backend involved; background.png is a placeholder stand-in for whatever scene image gets supplied for the real launch (any source is fine, this pipeline doesn't care)."
   }
 }

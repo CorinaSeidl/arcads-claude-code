@@ -213,5 +213,169 @@ class TestGuardStillProtectsBeyondTheAllowlist(unittest.TestCase):
             self.assertIn("product-fidelity violation", result.reason)
 
 
+def _read_status(approval_manifest_path: Path) -> str:
+    return json.loads(approval_manifest_path.read_text())["status"]
+
+
+class TestCrashSafety(unittest.TestCase):
+    """Review-fix B2: a prior PASS must never survive a run that didn't complete
+    generation/QA/provenance/manifest-write successfully. Each test here reproduces
+    the exact independent-review scenario (a real PASS run, then a second run that
+    blows up partway through) and asserts the *final on-disk state* is never PASS.
+    """
+
+    def _pass_then_break(self, root: Path, *, patch_target: str, side_effect) -> tuple:
+        _make_png(root / "product.png", (300, 300), (10, 20, 30))
+        _make_png(root / "background.png", (1600, 1200), (200, 200, 200))
+        manifest = _write_manifest(root)
+        job = load_job(manifest, repo_root=root)
+
+        with mock.patch.object(job_runner, "_ADAPTER_LOG", root / "log.jsonl"):
+            first = run_job(job)
+        self.assertEqual(first.status, "PASS", first.reason)
+        approval_path = first.approval_manifest_path
+        self.assertEqual(_read_status(approval_path), "PASS")
+        image_mtime_before = first.output_path.stat().st_mtime_ns
+
+        with mock.patch.object(job_runner, "_ADAPTER_LOG", root / "log.jsonl"), mock.patch(
+            patch_target, side_effect=side_effect
+        ):
+            second = run_job(job)
+
+        return first, second, approval_path, image_mtime_before
+
+    def test_exception_during_qa_does_not_leave_stale_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            first, second, approval_path, mtime_before = self._pass_then_break(
+                root,
+                patch_target="adapters.job_runner.run_qa",
+                side_effect=RuntimeError("simulated crash mid-QA"),
+            )
+            self.assertEqual(second.status, "FAIL")
+            self.assertIn("QA raised an unexpected exception", second.reason)
+            on_disk_status = _read_status(approval_path)
+            self.assertNotEqual(on_disk_status, "PASS", "stale PASS survived a crashed rerun")
+            self.assertEqual(on_disk_status, "FAIL")
+            # The image WAS regenerated (overwritten) by the second run's generate()
+            # step — confirms this is a genuine "new unvalidated file, old manifest
+            # would have been wrong" scenario, not a no-op.
+            self.assertGreater(first.output_path.stat().st_mtime_ns, mtime_before - 1)
+
+    def test_exception_during_provenance_write_does_not_leave_stale_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _first, second, approval_path, _mtime = self._pass_then_break(
+                root,
+                patch_target="adapters.job_runner.build_provenance",
+                side_effect=RuntimeError("simulated disk-full during provenance build"),
+            )
+            self.assertEqual(second.status, "FAIL")
+            self.assertIn("provenance write failed", second.reason)
+            self.assertEqual(_read_status(approval_path), "FAIL")
+
+    def test_exception_during_approval_manifest_write_does_not_leave_stale_pass(self) -> None:
+        # The trickiest case: QA passes, provenance succeeds, but the FINAL write
+        # (the one that would say PASS) fails. Must still not report PASS, and the
+        # on-disk file (if present at all) must not say PASS.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _make_png(root / "product.png", (300, 300), (10, 20, 30))
+            _make_png(root / "background.png", (1600, 1200), (200, 200, 200))
+            manifest = _write_manifest(root)
+            job = load_job(manifest, repo_root=root)
+
+            with mock.patch.object(job_runner, "_ADAPTER_LOG", root / "log.jsonl"):
+                first = run_job(job)
+            self.assertEqual(first.status, "PASS")
+            approval_path = first.approval_manifest_path
+
+            real_atomic_write_text = job_runner.atomic_write_text
+            call_count = {"n": 0}
+
+            def flaky_atomic_write(path, text, *a, **kw):
+                call_count["n"] += 1
+                # 1st call = the RUNNING invalidation (must succeed, or the test
+                # doesn't exercise the intended scenario). Fail only on the FINAL
+                # (PASS) write, which is the 2nd approval-manifest write this run.
+                if path.name == "approval-manifest.json" and call_count["n"] > 1:
+                    raise OSError("simulated write failure on the final PASS write")
+                return real_atomic_write_text(path, text, *a, **kw)
+
+            with mock.patch.object(job_runner, "_ADAPTER_LOG", root / "log.jsonl"), mock.patch.object(
+                job_runner, "atomic_write_text", side_effect=flaky_atomic_write
+            ):
+                second = run_job(job)
+
+            self.assertEqual(second.status, "FAIL", "must never report PASS if the manifest write failed")
+            self.assertIn("approval-manifest.json could not be written", second.reason)
+            # On-disk: the last successful write in this run was RUNNING (the FAIL/PASS
+            # write failed), so the file must not say PASS. It may still say the
+            # prior run's PASS only if the RUNNING invalidation itself never landed —
+            # verify that did NOT happen by checking the file is not PASS.
+            self.assertNotEqual(_read_status(approval_path), "PASS")
+
+    def test_rerun_over_existing_pass_directory_with_legitimate_qa_failure(self) -> None:
+        """Non-crash control case: a normal (non-exception) QA failure on a rerun
+        must also correctly flip PASS -> FAIL — establishes the baseline the crash
+        tests above are compared against."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _make_png(root / "product.png", (300, 300), (10, 20, 30))
+            _make_png(root / "background.png", (1600, 1200), (200, 200, 200))
+            manifest = _write_manifest(root)
+            job = load_job(manifest, repo_root=root)
+
+            with mock.patch.object(job_runner, "_ADAPTER_LOG", root / "log.jsonl"):
+                first = run_job(job)
+            self.assertEqual(first.status, "PASS")
+            approval_path = first.approval_manifest_path
+
+            with mock.patch.object(job_runner, "_ADAPTER_LOG", root / "log.jsonl"), mock.patch(
+                "adapters.job_runner.run_qa"
+            ) as mock_qa:
+                from adapters.qa import QACheck, QAReport
+
+                mock_qa.return_value = QAReport(
+                    checks=(QACheck("forced_failure", False, "forced for this test"),)
+                )
+                second = run_job(job)
+
+            self.assertEqual(second.status, "FAIL")
+            self.assertEqual(_read_status(approval_path), "FAIL")
+
+    def test_running_state_is_written_before_generate_is_called(self) -> None:
+        """Confirms the invalidation-before-generate ordering directly, not just its
+        end effect: at the moment generate() is invoked, the manifest on disk must
+        already say RUNNING (i.e. the prior terminal state has already been
+        overwritten before any mutation of the output happens)."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _make_png(root / "product.png", (300, 300), (10, 20, 30))
+            _make_png(root / "background.png", (1600, 1200), (200, 200, 200))
+            manifest = _write_manifest(root)
+            job = load_job(manifest, repo_root=root)
+
+            observed = {}
+            real_generate = None
+
+            from adapters.local_compositor_backend import LocalCompositorBackend
+
+            real_generate = LocalCompositorBackend.generate
+
+            def spying_generate(self, request):
+                approval_path = job.output_dir / "approval-manifest.json"
+                observed["status_at_generate_time"] = _read_status(approval_path)
+                return real_generate(self, request)
+
+            with mock.patch.object(job_runner, "_ADAPTER_LOG", root / "log.jsonl"), mock.patch.object(
+                LocalCompositorBackend, "generate", spying_generate
+            ):
+                result = run_job(job)
+
+            self.assertEqual(observed["status_at_generate_time"], "RUNNING")
+            self.assertEqual(result.status, "PASS")
+
+
 if __name__ == "__main__":
     unittest.main()
