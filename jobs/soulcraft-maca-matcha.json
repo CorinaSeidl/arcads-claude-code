@@ -1,0 +1,23 @@
+{
+  "job_id": "soulcraft-maca-matcha-vertical-story",
+  "channel": "instagram_story",
+  "product": {
+    "asset": "references/products/048e6abb-00d5-4dae-820a-ad4769bc45d2.jpg",
+    "fidelity": "environment-only"
+  },
+  "background": {
+    "asset": "outputs/demo/background.png"
+  },
+  "aspect_ratio": "9:16",
+  "backend": "local_compositor",
+  "composite": {
+    "mode": "fit",
+    "position": "center",
+    "margin": 0.08
+  },
+  "output_dir": "outputs/jobs/soulcraft-maca-matcha-vertical-story",
+  "provenance_seed": {
+    "requested_by": "you@example.com",
+    "notes": "Vertical Instagram Story creative for the maca matcha launch. Local compositor smoke test — no generative backend involved; background.png is a placeholder stand-in for whatever scene image gets supplied for the real launch (any source is fine, this pipeline doesn't care)."
+  }
+}

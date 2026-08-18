@@ -6,15 +6,34 @@ description: >-
 
 # chatgpt-image-ad (Arcads)
 
-Generate one or more **standalone Meta ad image creatives** via Arcads' `POST /v2/images/generate` with `model: "gpt-image-2"`. Hands the image paths off to your Meta-ad-builder skill — this skill does not upload to Meta itself.
+Generate one or more **standalone Meta ad image creatives**. Hands the image paths off to your Meta-ad-builder skill — this skill does not upload to Meta itself.
+
+## Vendor-neutral adapter routing (read this first)
+
+Generation now runs through the repo's vendor-neutral adapter (`adapters/` at repo
+root — see `adapters/README.md` and `docs/adapter/DESIGN.md`) instead of calling
+`scripts/generate_image.py` directly. This skill no longer has vendor-specific
+execution logic of its own:
+
+- **`--backend arcads`** — the default, unchanged path. `adapters.ArcadsBackend` wraps
+  this exact `scripts/generate_image.py` (still locked to `gpt-image-2`, still the
+  same presigned-upload/poll/download flow) — the underlying script is untouched by
+  this change. This is what you use for prompt-driven generation.
+- **`--backend local_compositor`** — a second, credential-free backend for when the
+  goal is placing a canonical product photo into a scene without any AI redraw of the
+  product (see "Product-fidelity path" below). No Arcads account needed for this path.
+
+Both backends are reached through the same command — `python3 -m adapters generate`
+— so this skill is not duplicated per vendor; only the `--backend` flag changes.
 
 ## Read order
 
-1. **This file** — Arcads-specific endpoint, auth, presigned upload flow, workflow phases.
+1. **This file** — workflow phases, hard rules, adapter routing.
 2. **[shared/skills/chatgpt-image-ad/prompting/guide.md](../../shared/skills/chatgpt-image-ad/prompting/guide.md)** — model-specific prompting (what gpt-image-2 is good/bad at, when to switch to nano-banana).
 3. **[shared/skills/image-ad-prompting/prompting/prompt-library.md](../../shared/skills/image-ad-prompting/prompting/prompt-library.md)** — 30+ validated templates with per-model notes.
 4. **[shared/skills/image-ad-prompting/prompting/safety-suffixes.md](../../shared/skills/image-ad-prompting/prompting/safety-suffixes.md)** — the 3 always-on guards.
-5. **[scripts/generate_image.py](scripts/generate_image.py)** — the helper script (Python stdlib only).
+5. **[../../adapters/README.md](../../adapters/README.md)** — the adapter CLI (`generate`, `compose`), backend contract, how to add a vendor for real.
+6. **[scripts/generate_image.py](scripts/generate_image.py)** — the Arcads-specific script itself. You should not need to call this directly anymore; `adapters.ArcadsBackend` calls it for you. Still useful for troubleshooting Arcads-specific behavior in isolation.
 
 ## Hard rules — never relax
 
@@ -86,30 +105,68 @@ Per `arcads-external-api` conventions: present an estimated credit cost (read fr
 
 ### Phase 5: Generate
 
+Call the adapter, not the script directly. First a dry run to surface the cost
+estimate (no generation happens without `--confirm-cost`):
+
 ```bash
-~/.claude/skills/chatgpt-image-ad/scripts/generate_image.py \
+python3 -m adapters generate \
+  --backend arcads --model gpt-image-2 \
+  --kind image \
   --prompt "<rewritten>" \
   --aspect-ratio <ratio> \
   --n <N> \
   --image-ref <product.png> \
   [--image-ref <style-board.png>] \
-  --out ./generated \
-  --env-file .env
-
-# For an edit run:
-~/.claude/skills/chatgpt-image-ad/scripts/generate_image.py \
-  --mode image_edit \
-  --prompt "<edit-instruction>" \
-  --source <existing.png> \
-  [--image-ref <guidance.png>] \
-  --n <N> \
-  --out ./generated \
-  --env-file .env
+  --out ./generated
 ```
 
-Each line on stdout is one JSON variant (`variant`, `path`, `asset_id`, `width`, `height`, `prompt`, `mode`, `aspect_ratio`, `model`).
+Show the printed estimate to the user (per Phase 4). Once they confirm, re-run with
+`--confirm-cost` appended — this is the actual generation call:
 
-Log each call to `logs/arcads-api.jsonl` with `model=gpt-image-2`, the variant count, `referenceImages` count, and the returned `asset_id`s, per `arcads-external-api` skill conventions.
+```bash
+python3 -m adapters generate \
+  --backend arcads --model gpt-image-2 \
+  --kind image --prompt "<rewritten>" --aspect-ratio <ratio> --n <N> \
+  --image-ref <product.png> --out ./generated --confirm-cost
+
+# For an edit run:
+python3 -m adapters generate \
+  --backend arcads --model gpt-image-2 \
+  --kind image_edit --prompt "<edit-instruction>" --source <existing.png> \
+  [--image-ref <guidance.png>] --n <N> --out ./generated --confirm-cost
+```
+
+Each line on stdout is one JSON result (`variant`, `path`, `backend`, `model`, `cost`).
+Internally this still runs the unchanged `scripts/generate_image.py` against Arcads —
+same presigned-upload flow, same brand-contract lock to `gpt-image-2`, same QA/error
+behavior as before. The adapter also appends a backend-agnostic provenance record to
+`logs/adapter-calls.jsonl`; keep also logging to `logs/arcads-api.jsonl` per
+`arcads-external-api` skill conventions (model=gpt-image-2, variant count,
+`referenceImages` count, returned `asset_id`s) since that log's `creditsCharged`
+history is what powers this skill's cost estimates.
+
+### Product-fidelity path — compositing instead of generating
+
+If the ad needs a **specific real product** with packaging/label/logo text that must
+render exactly (not an AI approximation of it), do not run it through Phase 3-5's
+prompt-driven path at all — a text-to-image call cannot guarantee label text survives
+legibly. Use the credential-free compositor instead: place the canonical product photo
+(e.g. from `references/products/`) onto a background — either one you generate with
+this skill's normal path (background only, no product in the prompt) or one supplied
+from anywhere else (a photo, another tool's output — the workflow doesn't care):
+
+```bash
+python3 -m adapters compose \
+  --product references/products/<canonical-product-photo>.jpg \
+  --background <any-local-background.png> \
+  --output ./generated/<name>-<aspect>.png \
+  --aspect 9:16
+```
+
+This never calls Arcads or any vendor, is fully deterministic (same inputs → byte-
+identical output), and is enforced in code: `adapters.policy.ProductFidelityGuard`
+refuses to let a product-locked request reach a full-generation backend. See
+`docs/adapter/PRODUCT_FIDELITY.md`.
 
 ### Phase 6: Visual QA (MANDATORY)
 
@@ -147,9 +204,12 @@ Optionally, write the selected paths to `./generated/run-<ts>.jsonl` (one path p
 ## Files this skill owns
 
 - `~/.claude/skills/chatgpt-image-ad/SKILL.md` — this file
-- `~/.claude/skills/chatgpt-image-ad/scripts/generate_image.py` — Arcads gpt-image-2 caller (presigned upload + generate + poll + download)
+- `~/.claude/skills/chatgpt-image-ad/scripts/generate_image.py` — Arcads gpt-image-2 caller (presigned upload + generate + poll + download); called by `adapters.ArcadsBackend`, not directly, per the routing section above.
 
 ## See also
+
+- **[adapters/README.md](../../adapters/README.md)** and **[docs/adapter/DESIGN.md](../../docs/adapter/DESIGN.md)** — the vendor-neutral adapter this skill routes through
+- **[docs/adapter/PRODUCT_FIDELITY.md](../../docs/adapter/PRODUCT_FIDELITY.md)** — the hard rule behind the compositor path above
 
 - **[shared/skills/chatgpt-image-ad/prompting/guide.md](../../shared/skills/chatgpt-image-ad/prompting/guide.md)** — model-specific prompting (gpt-image-2 strengths/limits, when to switch to nano-banana)
 - **[shared/skills/image-ad-prompting/prompting/prompt-library.md](../../shared/skills/image-ad-prompting/prompting/prompt-library.md)** — shared template library (30+ entries with per-model notes)

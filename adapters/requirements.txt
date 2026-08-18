@@ -1,0 +1,9 @@
+# Python dependencies for the adapters/ package.
+# Install:  python3 -m pip install --user -r adapters/requirements.txt
+#
+# Only local_compositor_backend.py needs this — everything else in adapters/ is
+# stdlib-only (matching skills/*/scripts/generate_image.py's convention). Real pixel
+# compositing (resize/crop/paste) isn't feasible to hand-roll against arbitrary
+# JPEG/PNG/WEBP inputs with the stdlib alone, so this one backend declares Pillow as
+# a real dependency rather than faking it.
+Pillow>=10.0.0
